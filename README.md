@@ -1,6 +1,6 @@
 # Menu Bar To-Do
 
-A minimalist macOS menu bar to-do list with two tabs: **Work** and **Life**.
+A minimalist macOS menu bar to-do list with three tabs: **Work**, **Life** and **Threads**.
 
 - Click the circle to complete a todo; it disappears and isn't stored.
 - Type in the last row and press Return to add a todo.

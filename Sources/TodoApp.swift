@@ -3,7 +3,7 @@ import SwiftUI
 // MARK: - Model
 
 enum Tab: String, Codable, CaseIterable, Identifiable {
-    case work = "Work", life = "Life"
+    case work = "Work", life = "Life", threads = "Threads"
     var id: String { rawValue }
 }
 
