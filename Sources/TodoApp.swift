@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 // MARK: - Model
 
@@ -70,11 +71,31 @@ final class TodoStore: ObservableObject {
     }
 }
 
+/// UI state shared between the AppKit panel controller and the SwiftUI view.
+@MainActor
+final class PanelState: ObservableObject {
+    @Published var tab: Tab {
+        didSet { UserDefaults.standard.set(tab.rawValue, forKey: "selectedTab") }
+    }
+    /// Bumped each time the panel opens so the view can focus the text field.
+    @Published var openCount = 0
+
+    init() {
+        tab = UserDefaults.standard.string(forKey: "selectedTab").flatMap(Tab.init) ?? .work
+    }
+
+    func cycleTab(backward: Bool) {
+        let all = Tab.allCases
+        let i = all.firstIndex(of: tab) ?? 0
+        tab = all[(i + (backward ? all.count - 1 : 1)) % all.count]
+    }
+}
+
 // MARK: - Views
 
 struct TodoListView: View {
     @EnvironmentObject var store: TodoStore
-    @AppStorage("selectedTab") private var tab: Tab = .work
+    @EnvironmentObject var state: PanelState
     @State private var newTitle = ""
     @FocusState private var inputFocused: Bool
 
@@ -83,10 +104,10 @@ struct TodoListView: View {
             // Tabs
             HStack(spacing: 16) {
                 ForEach(Tab.allCases) { t in
-                    Button(t.rawValue) { tab = t }
+                    Button(t.rawValue) { state.tab = t }
                         .buttonStyle(.plain)
-                        .font(.system(size: 13, weight: tab == t ? .semibold : .regular))
-                        .foregroundStyle(tab == t ? .primary : .tertiary)
+                        .font(.system(size: 13, weight: state.tab == t ? .semibold : .regular))
+                        .foregroundStyle(state.tab == t ? .primary : .tertiary)
                 }
             }
             .padding(.bottom, 10)
@@ -94,7 +115,7 @@ struct TodoListView: View {
             // Todos
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(store.items(in: tab)) { item in
+                    ForEach(store.items(in: state.tab)) { item in
                         TodoRow(item: item)
                     }
                 }
@@ -113,24 +134,21 @@ struct TodoListView: View {
                     .font(.system(size: 13))
                     .focused($inputFocused)
                     .onSubmit {
-                        store.add(newTitle, to: tab)
+                        store.add(newTitle, to: state.tab)
                         newTitle = ""
                     }
             }
             .padding(.vertical, 6)
-
-            // Invisible ⌘Q so the app can still be quit.
-            Button("") { NSApplication.shared.terminate(nil) }
-                .keyboardShortcut("q")
-                .opacity(0)
-                .frame(width: 0, height: 0)
         }
         .padding(.horizontal, 14)
         .padding(.top, 12)
         .padding(.bottom, 6)
         .frame(width: 280)
+        .background(VisualEffectBackground())
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .onAppear { inputFocused = true }
-        .onChange(of: tab) { _ in inputFocused = true }
+        .onChange(of: state.openCount) { _ in inputFocused = true }
+        .onChange(of: state.tab) { _ in inputFocused = true }
     }
 }
 
@@ -164,18 +182,159 @@ struct TodoRow: View {
     }
 }
 
-// MARK: - App
+/// The translucent menu-style background used by system menu bar panels.
+struct VisualEffectBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let v = NSVisualEffectView()
+        v.material = .popover
+        v.blendingMode = .behindWindow
+        v.state = .active
+        return v
+    }
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+}
+
+// MARK: - Panel (AppKit)
+
+/// Borderless panel that can take keyboard focus without activating the app,
+/// so Esc drops you straight back into whatever you were doing.
+final class TodoPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private let store = TodoStore()
+    private let state = PanelState()
+    private var statusItem: NSStatusItem!
+    private var panel: TodoPanel!
+    private var keyMonitor: Any?
+    private var lastClosed = Date.distantPast
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = statusItem.button {
+            button.image = NSImage(systemSymbolName: "checklist", accessibilityDescription: "To-Do")
+            button.target = self
+            button.action = #selector(statusItemClicked)
+        }
+
+        let root = TodoListView()
+            .environmentObject(store)
+            .environmentObject(state)
+        let hosting = NSHostingController(rootView: root)
+        hosting.sizingOptions = .preferredContentSize
+
+        panel = TodoPanel(
+            contentRect: .zero,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered, defer: true
+        )
+        panel.contentViewController = hosting
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .popUpMenu
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.delegate = self
+
+        installKeyMonitor()
+    }
+
+    // menubartodo://open  — opens the panel (used by Raycast)
+    // menubartodo://toggle — opens or closes it
+    // menubartodo://work | life | threads — opens on that tab
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls where url.scheme == "menubartodo" {
+            let host = url.host?.lowercased() ?? "open"
+            if host == "toggle" {
+                panel.isVisible ? closePanel() : openPanel()
+            } else {
+                if let tab = Tab.allCases.first(where: { $0.rawValue.lowercased() == host }) {
+                    state.tab = tab
+                }
+                openPanel()
+            }
+        }
+    }
+
+    @objc private func statusItemClicked() {
+        // Clicking the icon while open first makes the panel resign key (closing it);
+        // don't immediately reopen it.
+        if panel.isVisible { closePanel() }
+        else if Date().timeIntervalSince(lastClosed) > 0.25 { openPanel() }
+    }
+
+    private func openPanel() {
+        state.openCount += 1
+        positionPanel()
+        panel.makeKeyAndOrderFront(nil)
+        statusItem.button?.highlight(true)
+    }
+
+    private func closePanel() {
+        guard panel.isVisible else { return }
+        panel.orderOut(nil)
+        statusItem.button?.highlight(false)
+        lastClosed = Date()
+    }
+
+    /// Drop the panel down from the menu bar icon, keeping it on screen.
+    private func positionPanel() {
+        guard let buttonWindow = statusItem.button?.window else { return }
+        let anchor = buttonWindow.frame
+        let screen = (buttonWindow.screen ?? NSScreen.main)?.visibleFrame ?? .zero
+        let size = panel.frame.size == .zero ? panel.contentViewController!.view.fittingSize : panel.frame.size
+        var x = anchor.minX
+        x = min(max(x, screen.minX + 8), screen.maxX - size.width - 8)
+        let top = anchor.minY - 4
+        panel.setFrame(NSRect(x: x, y: top - size.height, width: size.width, height: size.height), display: true)
+    }
+
+    // Content grows/shrinks as todos are added or completed — keep the top pinned.
+    func windowDidResize(_ notification: Notification) {
+        if panel.isVisible { positionPanel() }
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        closePanel()
+    }
+
+    // MARK: Keyboard shortcuts
+    // Esc closes the panel; Tab / Shift-Tab cycle tabs; ⌘Q quits.
+
+    private func installKeyMonitor() {
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, event.window === self.panel else { return event }
+            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            switch event.keyCode {
+            case 53: // Esc
+                self.closePanel()
+                return nil
+            case 48 where mods.subtracting(.shift).isEmpty: // Tab, Shift-Tab
+                self.state.cycleTab(backward: mods.contains(.shift))
+                return nil
+            case 12 where mods == .command: // ⌘Q
+                NSApp.terminate(nil)
+                return nil
+            default:
+                return event
+            }
+        }
+    }
+}
+
+// MARK: - Entry point
 
 @main
-struct MenuBarTodoApp: App {
-    @StateObject private var store = TodoStore()
-
-    var body: some Scene {
-        MenuBarExtra {
-            TodoListView().environmentObject(store)
-        } label: {
-            Image(systemName: "checklist")
-        }
-        .menuBarExtraStyle(.window)
+enum Main {
+    @MainActor static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        app.run()
     }
 }
