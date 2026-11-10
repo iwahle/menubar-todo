@@ -36,3 +36,7 @@ open build/MenuBarTodo.app
 
 To launch at login, move `build/MenuBarTodo.app` to `/Applications` and add it under
 System Settings → General → Login Items.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
