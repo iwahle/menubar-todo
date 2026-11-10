@@ -6,6 +6,7 @@ A minimalist macOS menu bar to-do list with three tabs: **Work**, **Life** and *
 - Type in the last row and press Return to add a todo.
 - Todos persist in `~/Library/Application Support/MenuBarTodo/todos.json`.
 - Press Tab / Shift-Tab to cycle between tabs.
+- Press ↑ / ↓ to select a todo, then Return to complete it.
 - Press Esc to close the popup.
 - Press ⌘Q while the popup is open to quit.
 

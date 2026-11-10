@@ -74,20 +74,69 @@ final class TodoStore: ObservableObject {
 /// UI state shared between the AppKit panel controller and the SwiftUI view.
 @MainActor
 final class PanelState: ObservableObject {
+    let store: TodoStore
+
     @Published var tab: Tab {
-        didSet { UserDefaults.standard.set(tab.rawValue, forKey: "selectedTab") }
+        didSet {
+            UserDefaults.standard.set(tab.rawValue, forKey: "selectedTab")
+            selectedID = nil
+        }
     }
     /// Bumped each time the panel opens so the view can focus the text field.
     @Published var openCount = 0
+    /// Row highlighted with the arrow keys. nil means the "add" row.
+    @Published var selectedID: UUID?
+    /// Rows showing their filled circle just before they disappear.
+    @Published private(set) var completing: Set<UUID> = []
 
-    init() {
+    init(store: TodoStore) {
+        self.store = store
         tab = UserDefaults.standard.string(forKey: "selectedTab").flatMap(Tab.init) ?? .work
+    }
+
+    /// Items in the current tab that can still be selected.
+    private var selectable: [TodoItem] {
+        store.items(in: tab).filter { !completing.contains($0.id) }
     }
 
     func cycleTab(backward: Bool) {
         let all = Tab.allCases
         let i = all.firstIndex(of: tab) ?? 0
         tab = all[(i + (backward ? all.count - 1 : 1)) % all.count]
+    }
+
+    /// Up/Down through the rows; the add row sits after the last item.
+    func moveSelection(up: Bool) {
+        let rows = selectable
+        guard !rows.isEmpty else { selectedID = nil; return }
+        // Positions 0..<count are items; count is the add row.
+        let current = selectedID.flatMap { id in rows.firstIndex { $0.id == id } } ?? rows.count
+        let next = up ? max(current - 1, 0) : min(current + 1, rows.count)
+        selectedID = next == rows.count ? nil : rows[next].id
+    }
+
+    /// Completes the selected row and moves the highlight to the next one.
+    /// Returns false when nothing is selected (so Return adds a todo instead).
+    func completeSelected() -> Bool {
+        guard let id = selectedID, let item = selectable.first(where: { $0.id == id }) else { return false }
+        complete(item)
+        return true
+    }
+
+    func complete(_ item: TodoItem) {
+        guard !completing.contains(item.id) else { return }
+        if selectedID == item.id {
+            let rows = selectable
+            let i = rows.firstIndex(of: item) ?? 0
+            let rest = rows.filter { $0.id != item.id }
+            selectedID = rest.isEmpty ? nil : rest[min(i, rest.count - 1)].id
+        }
+        completing.insert(item.id)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self else { return }
+            withAnimation(.easeOut(duration: 0.2)) { self.store.complete(item) }
+            self.completing.remove(item.id)
+        }
     }
 }
 
@@ -113,11 +162,16 @@ struct TodoListView: View {
             .padding(.bottom, 10)
 
             // Todos
-            ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(store.items(in: state.tab)) { item in
-                        TodoRow(item: item)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(store.items(in: state.tab)) { item in
+                            TodoRow(item: item).id(item.id)
+                        }
                     }
+                }
+                .onChange(of: state.selectedID) { id in
+                    if let id { proxy.scrollTo(id) }
                 }
             }
             .frame(maxHeight: 360)
@@ -133,6 +187,7 @@ struct TodoListView: View {
                     .textFieldStyle(.plain)
                     .font(.system(size: 13))
                     .focused($inputFocused)
+                    .onChange(of: newTitle) { _ in state.selectedID = nil }
                     .onSubmit {
                         store.add(newTitle, to: state.tab)
                         newTitle = ""
@@ -147,23 +202,25 @@ struct TodoListView: View {
         .background(VisualEffectBackground())
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .onAppear { inputFocused = true }
-        .onChange(of: state.openCount) { _ in inputFocused = true }
+        .onChange(of: state.openCount) { _ in
+            state.selectedID = nil
+            inputFocused = true
+        }
         .onChange(of: state.tab) { _ in inputFocused = true }
     }
 }
 
 struct TodoRow: View {
-    @EnvironmentObject var store: TodoStore
+    @EnvironmentObject var state: PanelState
     let item: TodoItem
-    @State private var checked = false
+
+    private var checked: Bool { state.completing.contains(item.id) }
+    private var selected: Bool { state.selectedID == item.id }
 
     var body: some View {
         HStack(spacing: 10) {
             Button {
-                checked = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                    withAnimation(.easeOut(duration: 0.2)) { store.complete(item) }
-                }
+                state.complete(item)
             } label: {
                 Image(systemName: checked ? "circle.inset.filled" : "circle")
                     .font(.system(size: 13))
@@ -178,6 +235,12 @@ struct TodoRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.vertical, 6)
+        .padding(.horizontal, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .fill(Color.primary.opacity(selected ? 0.08 : 0))
+        )
+        .padding(.horizontal, -6)
         .transition(.opacity)
     }
 }
@@ -205,7 +268,7 @@ final class TodoPanel: NSPanel {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let store = TodoStore()
-    private let state = PanelState()
+    private lazy var state = PanelState(store: store)
     private var statusItem: NSStatusItem!
     private var panel: TodoPanel!
     private var keyMonitor: Any?
@@ -303,7 +366,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     // MARK: Keyboard shortcuts
-    // Esc closes the panel; Tab / Shift-Tab cycle tabs; ⌘Q quits.
+    // Esc closes the panel; Tab / Shift-Tab cycle tabs; ↑/↓ select a row;
+    // Return completes the selected row (or adds the typed todo); ⌘Q quits.
 
     private func installKeyMonitor() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -316,6 +380,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             case 48 where mods.subtracting(.shift).isEmpty: // Tab, Shift-Tab
                 self.state.cycleTab(backward: mods.contains(.shift))
                 return nil
+            case 125, 126: // ↓ ↑ (arrow keys carry the function/numericPad flags)
+                guard mods.subtracting([.function, .numericPad]).isEmpty else { return event }
+                self.state.moveSelection(up: event.keyCode == 126)
+                return nil
+            case 36, 76: // Return, keypad Enter
+                guard mods.subtracting(.numericPad).isEmpty else { return event }
+                return self.state.completeSelected() ? nil : event
             case 12 where mods == .command: // ⌘Q
                 NSApp.terminate(nil)
                 return nil
