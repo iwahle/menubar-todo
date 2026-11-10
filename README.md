@@ -1,12 +1,15 @@
 # Menu Bar To-Do
 
-A minimalist macOS menu bar to-do list with three tabs: **Work**, **Life** and **Threads**.
+A minimalist macOS menu bar to-do list with tabs (**Work**, **Life** and **Threads** by default; editable in Preferences).
 
 - Click the circle to complete a todo; it disappears and isn't stored.
 - Type in the last row and press Return to add a todo.
+- Enter `---` to add a divider line. Select it by clicking it or with the arrow keys, then press Delete to remove it.
+- Drag rows (todos or dividers) to reorder them.
 - Todos persist in `~/Library/Application Support/MenuBarTodo/todos.json`.
 - Press Tab / Shift-Tab to cycle between tabs.
-- Press ↑ / ↓ to select a todo, then Return to complete it.
+- Click a todo or press ↑ / ↓ to select it, then press Return to complete it.
+- Press ⌘, to open Preferences, where you can rename, add, remove and reorder tabs.
 - Press Esc to close the popup.
 - Press ⌘Q while the popup is open to quit.
 
@@ -18,7 +21,7 @@ The app responds to these links:
 | --- | --- |
 | `menubartodo://open` | Open the panel |
 | `menubartodo://toggle` | Open or close the panel |
-| `menubartodo://work`, `life`, `threads` | Open the panel on that tab |
+| `menubartodo://<tab name>` (e.g. `work`) | Open the panel on that tab (case and spaces ignored) |
 
 To open it with a hotkey from any app:
 
