@@ -2,6 +2,17 @@
 
 New features, most recent first.
 
+## 2026-11-18 — Keep done and struck-through todos (optional)
+New Preferences options, all off by default so nothing changes unless you turn them on:
+- **Keep done and struck-through todos**: checked-off todos stay, greyed out, for a set number of hours (24 by default; 1–168), then disappear. Click the circle or press Return again to reopen one.
+- **Strike through**: select a todo and press ⌘⇧X to cross it out — for things that fell off the plate rather than got done. Press again to reopen.
+- **Sort sections: open, done, struck through**: within each divider-separated section, open todos come first, then done, then struck through.
+- A **Quit** button in Preferences.
+- ⌘Z / ⌘⇧Z undo and redo changes to the list.
+- Shift-↑ / Shift-↓ move the selected row up or down.
+- ⌘⇧D adds a divider below the selected row (or at the end of the list).
+- Delete / Backspace on a selected todo now deletes it from the list (previously it only removed dividers).
+
 ## 2026-11-10 — Click to select rows
 Click any row (todo or divider) to select it, then press Return to complete a todo.
 

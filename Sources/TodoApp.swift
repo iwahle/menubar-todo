@@ -3,6 +3,26 @@ import AppKit
 import Combine
 import UniformTypeIdentifiers
 
+// MARK: - Settings
+
+/// Preferences stored in UserDefaults. Every option defaults to off, so the app
+/// behaves exactly as it always has until you opt in.
+enum Prefs {
+    /// Completed and struck-through todos stay visible for `keepHours` instead of vanishing.
+    static let keepCompleted = "keepCompleted"
+    static let keepHours = "keepCompletedHours"
+    /// Within each divider-separated section, list open todos, then done, then struck through.
+    static let doneLast = "sortDoneLast"
+
+    static let defaultHours = 24
+
+    static var isKeepingCompleted: Bool { UserDefaults.standard.bool(forKey: keepCompleted) }
+    static var hours: Int {
+        let h = UserDefaults.standard.integer(forKey: keepHours)
+        return h > 0 ? h : defaultHours
+    }
+}
+
 // MARK: - Model
 
 /// A user-editable tab. `id` is stable; `name` can be renamed in Preferences.
@@ -23,6 +43,16 @@ struct TodoItem: Identifiable, Codable, Equatable {
     var tab: String
     /// A horizontal-line separator (created by entering "---") rather than a todo.
     var isDivider = false
+    /// When the todo was checked off. Only set while "keep completed" is on;
+    /// otherwise completing removes the todo.
+    var completedAt: Date?
+    /// When the todo was struck through — dropped rather than done. Never set
+    /// together with `completedAt`.
+    var struckAt: Date?
+
+    var isDone: Bool { completedAt != nil }
+    var isStruck: Bool { struckAt != nil }
+    var isOpen: Bool { !isDone && !isStruck }
 
     init(title: String, tab: String, isDivider: Bool = false) {
         self.title = title
@@ -37,6 +67,8 @@ struct TodoItem: Identifiable, Codable, Equatable {
         title = try c.decode(String.self, forKey: .title)
         tab = try c.decodeIfPresent(String.self, forKey: .tab) ?? ""
         isDivider = try c.decodeIfPresent(Bool.self, forKey: .isDivider) ?? false
+        completedAt = try c.decodeIfPresent(Date.self, forKey: .completedAt)
+        struckAt = try c.decodeIfPresent(Date.self, forKey: .struckAt)
     }
 }
 
@@ -48,6 +80,8 @@ final class TodoStore: ObservableObject {
     @Published var tabs: [TodoTab] = TodoTab.defaults {
         didSet { save(tabs, to: "tabs.json") }
     }
+
+    private var observers: Set<AnyCancellable> = []
 
     private let dir: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -78,19 +112,98 @@ final class TodoStore: ObservableObject {
             }
     }
 
+    /// Re-check expiry when preferences change and once an hour.
+    func startExpiryChecks() {
+        purgeExpired()
+        NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.purgeExpired()
+                self?.objectWillChange.send() // re-sort if "done first" changed
+            }
+            .store(in: &observers)
+        Timer.publish(every: 3600, on: .main, in: .common).autoconnect()
+            .sink { [weak self] _ in self?.purgeExpired() }
+            .store(in: &observers)
+    }
+
+    /// Removes done / struck todos older than the keep duration — or all of them when
+    /// "keep completed" is off.
+    func purgeExpired() {
+        let keep = Prefs.isKeepingCompleted
+        let cutoff = Date().addingTimeInterval(-Double(Prefs.hours) * 3600)
+        let expired = { (item: TodoItem) in
+            guard let closed = item.completedAt ?? item.struckAt else { return false }
+            return !keep || closed < cutoff
+        }
+        if items.contains(where: expired) { items.removeAll(where: expired) }
+    }
+
     // MARK: Todos
 
-    func items(in tabID: String) -> [TodoItem] { items.filter { $0.tab == tabID } }
+    /// Items in a tab, in display order. With "done last" on, each divider-separated
+    /// section lists open todos, then done, then struck through (otherwise stored order is kept).
+    func items(in tabID: String) -> [TodoItem] {
+        let rows = items.filter { $0.tab == tabID }
+        guard Prefs.isKeepingCompleted, UserDefaults.standard.bool(forKey: Prefs.doneLast) else { return rows }
+        var result: [TodoItem] = []
+        var section: [TodoItem] = []
+        func flush() {
+            result += section.filter(\.isOpen) + section.filter(\.isDone) + section.filter(\.isStruck)
+            section = []
+        }
+        for row in rows {
+            if row.isDivider { flush(); result.append(row) } else { section.append(row) }
+        }
+        flush()
+        return result
+    }
 
     func todoCount(in tabID: String) -> Int { items.filter { $0.tab == tabID && !$0.isDivider }.count }
+
+    // MARK: Undo / redo
+    // Each change to the list saves a snapshot of it beforehand. Kept in memory
+    // only (cleared on quit), capped at `undoLimit` steps.
+
+    private var undoStack: [[TodoItem]] = []
+    private var redoStack: [[TodoItem]] = []
+    private let undoLimit = 100
+
+    /// Call before changing `items` so the change can be undone.
+    func recordUndo() {
+        undoStack.append(items)
+        if undoStack.count > undoLimit { undoStack.removeFirst() }
+        redoStack.removeAll()
+    }
+
+    /// Returns false when there's nothing to undo.
+    @discardableResult
+    func undo() -> Bool {
+        // Skip snapshots identical to now (e.g. a drag that didn't move anything).
+        while let last = undoStack.last, last == items { undoStack.removeLast() }
+        guard let previous = undoStack.popLast() else { return false }
+        redoStack.append(items)
+        items = previous
+        return true
+    }
+
+    @discardableResult
+    func redo() -> Bool {
+        guard let next = redoStack.popLast() else { return false }
+        undoStack.append(items)
+        items = next
+        return true
+    }
 
     func add(_ title: String, to tabID: String) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        recordUndo()
         items.append(TodoItem(title: trimmed, tab: tabID, isDivider: trimmed == "---"))
     }
 
     /// Moves `id` into the position currently held by `targetID` (used while dragging).
+    /// Not recorded per step — the row records one undo when the drag starts.
     func move(_ id: UUID, onto targetID: UUID) {
         guard id != targetID,
               let from = items.firstIndex(where: { $0.id == id }),
@@ -98,9 +211,51 @@ final class TodoStore: ObservableObject {
         items.move(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
     }
 
-    /// Completing a todo removes it entirely — nothing is kept.
+    /// Completing removes the todo entirely, unless "keep completed" is on, in which
+    /// case it's marked done and removed once it expires. Dividers are always removed.
     func complete(_ item: TodoItem) {
+        recordUndo()
+        if Prefs.isKeepingCompleted && !item.isDivider,
+           let i = items.firstIndex(where: { $0.id == item.id }) {
+            items[i].completedAt = Date()
+            items[i].struckAt = nil
+        } else {
+            items.removeAll { $0.id == item.id }
+        }
+    }
+
+    /// Adds a divider just below `afterID` if given, otherwise at the end of the tab.
+    func addDivider(to tabID: String, after afterID: UUID?) {
+        let divider = TodoItem(title: "---", tab: tabID, isDivider: true)
+        recordUndo()
+        if let afterID, let i = items.firstIndex(where: { $0.id == afterID }) {
+            items.insert(divider, at: i + 1)
+        } else {
+            items.append(divider)
+        }
+    }
+
+    /// Deletes a todo or divider outright, whatever its state.
+    func remove(_ item: TodoItem) {
+        recordUndo()
         items.removeAll { $0.id == item.id }
+    }
+
+    /// Strikes a todo through: it fell off the plate rather than got done. Only
+    /// meaningful while "keep completed" is on (callers check).
+    func strike(_ item: TodoItem) {
+        guard !item.isDivider, let i = items.firstIndex(where: { $0.id == item.id }) else { return }
+        recordUndo()
+        items[i].struckAt = Date()
+        items[i].completedAt = nil
+    }
+
+    /// Returns a done or struck-through todo to open.
+    func reopen(_ item: TodoItem) {
+        guard let i = items.firstIndex(where: { $0.id == item.id }) else { return }
+        recordUndo()
+        items[i].completedAt = nil
+        items[i].struckAt = nil
     }
 
     // MARK: Tabs
@@ -117,6 +272,9 @@ final class TodoStore: ObservableObject {
         guard tabs.count > 1 else { return }
         tabs.removeAll { $0.id == id }
         items.removeAll { $0.tab == id }
+        // Old snapshots would bring back todos for a tab that's gone.
+        undoStack.removeAll()
+        redoStack.removeAll()
     }
 
     func moveTabs(from source: IndexSet, to destination: Int) {
@@ -188,32 +346,114 @@ final class PanelState: ObservableObject {
         selectedID = next == rows.count ? nil : rows[next].id
     }
 
-    /// Completes the selected row and moves the highlight to the next one.
+    /// Completes the selected row (or un-completes a done one) and moves the
+    /// highlight to the next row.
     /// Returns false when nothing is selected (so Return adds a todo instead).
     func completeSelected() -> Bool {
         guard let id = selectedID, let item = selectable.first(where: { $0.id == id }) else { return false }
-        complete(item)
+        toggle(item)
         return true
     }
 
-    /// Delete / Backspace on a selected divider removes it. Returns true whenever a
-    /// row is selected, so the key never edits the add field behind the highlight.
+    /// Delete / Backspace removes the selected row (todo or divider) from the list.
+    /// Returns false when nothing is selected, so the key edits the add field instead.
     func deleteSelected() -> Bool {
         guard let id = selectedID, let item = selectable.first(where: { $0.id == id }) else { return false }
-        if item.isDivider { complete(item) }
+        advanceSelection(past: item)
+        // Remove on the next run-loop pass, outside the key event (like completing
+        // does). Removing inside the event left the panel undrawn until the next key.
+        DispatchQueue.main.async { [weak self] in
+            withAnimation(.easeOut(duration: 0.2)) { self?.store.remove(item) }
+        }
         return true
+    }
+
+    /// Shift-↑ / Shift-↓: move the selected row one place up or down (one undo step
+    /// per press). Returns false when nothing is selected, so Shift-arrows can
+    /// select text in the add field instead.
+    func moveSelectedRow(up: Bool) -> Bool {
+        guard let id = selectedID, let item = selectable.first(where: { $0.id == id }) else { return false }
+        let rows = store.items(in: tabID)
+        guard let i = rows.firstIndex(where: { $0.id == id }) else { return true }
+        let candidates = up ? Array(rows[..<i].reversed()) : Array(rows[(i + 1)...])
+        // With sorting on, hop over rows in a different group (open / done / struck);
+        // swapping with them wouldn't visibly move anything.
+        let sorted = Prefs.isKeepingCompleted && UserDefaults.standard.bool(forKey: Prefs.doneLast)
+        func group(_ t: TodoItem) -> Int { t.isOpen ? 0 : t.isDone ? 1 : 2 }
+        guard let target = candidates.first(where: {
+            !sorted || item.isDivider || $0.isDivider || group($0) == group(item)
+        }) else { return true }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.store.recordUndo()
+            withAnimation(.easeInOut(duration: 0.15)) { self.store.move(id, onto: target.id) }
+        }
+        return true
+    }
+
+    /// ⌘Z / ⌘⇧Z on the list. Clears the highlight if its row no longer exists.
+    func undo(redo: Bool) {
+        withAnimation(.easeOut(duration: 0.2)) {
+            _ = redo ? store.redo() : store.undo()
+        }
+        if let id = selectedID, !store.items.contains(where: { $0.id == id }) { selectedID = nil }
+    }
+
+    /// ⌘⇧D: add a divider below the selected row, or at the end of the tab.
+    func addDivider() {
+        let after = selectedID
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            withAnimation(.easeOut(duration: 0.2)) { self.store.addDivider(to: self.tabID, after: after) }
+        }
+    }
+
+    /// ⌘⇧X: strike through the selected todo (or restore a struck one).
+    /// Returns false when no todo is selected.
+    func strikeSelected() -> Bool {
+        guard let id = selectedID, let item = selectable.first(where: { $0.id == id }),
+              !item.isDivider else { return false }
+        toggleStrike(item)
+        return true
+    }
+
+    /// Completes a todo, or reopens one that's already done.
+    /// A struck-through todo becomes done.
+    func toggle(_ item: TodoItem) {
+        if item.isDone {
+            withAnimation(.easeOut(duration: 0.2)) { store.reopen(item) }
+        } else {
+            complete(item)
+        }
+    }
+
+    /// Strikes a todo through, or reopens one that's already struck.
+    /// Does nothing unless "keep completed" is on.
+    func toggleStrike(_ item: TodoItem) {
+        guard Prefs.isKeepingCompleted, !item.isDivider, !completing.contains(item.id) else { return }
+        if item.isStruck {
+            withAnimation(.easeOut(duration: 0.2)) { store.reopen(item) }
+        } else {
+            advanceSelection(past: item)
+            withAnimation(.easeOut(duration: 0.2)) { store.strike(item) }
+        }
+    }
+
+    /// If `item` is highlighted, move the highlight to the row after it.
+    private func advanceSelection(past item: TodoItem) {
+        guard selectedID == item.id else { return }
+        let rows = selectable
+        let i = rows.firstIndex(of: item) ?? 0
+        let rest = rows.filter { $0.id != item.id }
+        selectedID = rest.isEmpty ? nil : rest[min(i, rest.count - 1)].id
     }
 
     func complete(_ item: TodoItem) {
-        guard !completing.contains(item.id) else { return }
-        if selectedID == item.id {
-            let rows = selectable
-            let i = rows.firstIndex(of: item) ?? 0
-            let rest = rows.filter { $0.id != item.id }
-            selectedID = rest.isEmpty ? nil : rest[min(i, rest.count - 1)].id
-        }
+        guard !completing.contains(item.id), !item.isDone else { return }
+        advanceSelection(past: item)
         completing.insert(item.id)
         // Todos show their filled circle briefly; dividers just go.
+        // (With "keep completed" on, the todo then stays, greyed out.)
         DispatchQueue.main.asyncAfter(deadline: .now() + (item.isDivider ? 0 : 0.25)) { [weak self] in
             guard let self else { return }
             withAnimation(.easeOut(duration: 0.2)) { self.store.complete(item) }
@@ -305,7 +545,7 @@ struct TodoRow: View {
     @EnvironmentObject var state: PanelState
     let item: TodoItem
 
-    private var checked: Bool { state.completing.contains(item.id) }
+    private var checked: Bool { !item.isOpen || state.completing.contains(item.id) }
     private var selected: Bool { state.selectedID == item.id }
 
     var body: some View {
@@ -314,7 +554,7 @@ struct TodoRow: View {
             .contentShape(Rectangle())
             .onTapGesture {
                 // Click anywhere on a row (except the circle) to select it;
-                // then Return completes a todo and Delete removes a divider.
+                // then Return completes it and Delete removes it.
                 state.selectedID = item.id
                 state.focusRequest += 1
             }
@@ -326,6 +566,7 @@ struct TodoRow: View {
             .transition(.opacity)
             .onDrag {
                 state.draggingID = item.id
+                state.store.recordUndo() // one undo step per drag
                 return NSItemProvider(object: item.id.uuidString as NSString)
             }
             .onDrop(of: [.text], delegate: RowDropDelegate(target: item, state: state))
@@ -341,7 +582,7 @@ struct TodoRow: View {
         } else {
             HStack(spacing: 10) {
                 Button {
-                    state.complete(item)
+                    state.toggle(item)
                 } label: {
                     Image(systemName: checked ? "circle.inset.filled" : "circle")
                         .font(.system(size: 13))
@@ -352,6 +593,7 @@ struct TodoRow: View {
 
                 Text(item.title)
                     .font(.system(size: 13))
+                    .strikethrough(item.isStruck)
                     .foregroundStyle(checked ? .tertiary : .primary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -398,6 +640,9 @@ struct PreferencesView: View {
     @EnvironmentObject var store: TodoStore
     @State private var pendingDelete: TodoTab?
     @FocusState private var focusedTab: String?
+    @AppStorage(Prefs.keepCompleted) private var keepCompleted = false
+    @AppStorage(Prefs.keepHours) private var keepHours = Prefs.defaultHours
+    @AppStorage(Prefs.doneLast) private var doneLast = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -438,9 +683,33 @@ struct PreferencesView: View {
             Text("Drag to reorder. Removing a tab deletes its todos.")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
+
+            Divider().padding(.vertical, 4)
+
+            Text("Completed todos")
+                .font(.system(size: 13, weight: .semibold))
+
+            Toggle("Keep done and struck-through todos", isOn: $keepCompleted)
+            Stepper(value: $keepHours, in: 1...168) {
+                Text("Remove after \(keepHours) hour\(keepHours == 1 ? "" : "s")")
+            }
+            .disabled(!keepCompleted)
+            .padding(.leading, 20)
+            Toggle("Sort sections: open, done, struck through", isOn: $doneLast)
+                .disabled(!keepCompleted)
+            Text("⌘⇧X strikes through the selected todo (it fell off the plate).")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+
+            Spacer(minLength: 0)
+            HStack {
+                Spacer()
+                Button("Quit Menu Bar To-Do") { NSApp.terminate(nil) }
+            }
         }
+        .toggleStyle(.checkbox)
         .padding(16)
-        .frame(width: 300, height: 320)
+        .frame(width: 300, height: 520)
         .alert(
             "Remove “\(pendingDelete?.displayName ?? "")”?",
             isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
@@ -508,6 +777,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.hidesOnDeactivate = false
         panel.delegate = self
 
+        store.startExpiryChecks()
         setUpMainMenu()
         installKeyMonitor()
     }
@@ -538,6 +808,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func openPanel() {
+        store.purgeExpired()
         state.openCount += 1
         positionPanel()
         panel.makeKeyAndOrderFront(nil)
@@ -623,7 +894,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: Keyboard shortcuts (panel)
     // Esc closes the panel; Tab / Shift-Tab cycle tabs; ↑/↓ select a row;
     // Return completes the selected row (or adds the typed todo);
-    // Delete removes a selected divider;
+    // Delete removes the selected row;
+    // Shift-↑/↓ moves the selected row up / down;
+    // ⌘Z / ⌘⇧Z undo / redo list changes (text edits while typing in the add field);
+    // ⌘⇧D adds a divider (below the selected row, or at the end);
+    // ⌘⇧X strikes through the selected todo (when keeping completed todos);
     // ⌘, opens Preferences; ⌘Q quits.
 
     private func installKeyMonitor() {
@@ -638,7 +913,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.state.cycleTab(backward: mods.contains(.shift))
                 return nil
             case 125, 126: // ↓ ↑ (arrow keys carry the function/numericPad flags)
-                guard mods.subtracting([.function, .numericPad]).isEmpty else { return event }
+                let arrowMods = mods.subtracting([.function, .numericPad])
+                if arrowMods == .shift { // Shift-↑/↓ reorders the selected row
+                    return self.state.moveSelectedRow(up: event.keyCode == 126) ? nil : event
+                }
+                guard arrowMods.isEmpty else { return event }
                 self.state.moveSelection(up: event.keyCode == 126)
                 return nil
             case 36, 76: // Return, keypad Enter
@@ -647,8 +926,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             case 51, 117: // Delete (Backspace), Forward Delete
                 guard mods.subtracting([.function, .numericPad]).isEmpty else { return event }
                 return self.state.deleteSelected() ? nil : event
+            case 2 where mods == [.command, .shift]: // ⌘⇧D
+                self.state.addDivider()
+                return nil
+            case 7 where mods == [.command, .shift]: // ⌘⇧X
+                return self.state.strikeSelected() ? nil : event
             case 43 where mods == .command: // ⌘,
                 self.openPreferences()
+                return nil
+            case 6 where mods == .command || mods == [.command, .shift]: // ⌘Z, ⌘⇧Z
+                // While something is typed in the add field, ⌘Z edits that text.
+                if let editor = self.panel.firstResponder as? NSTextView, !editor.string.isEmpty {
+                    return event
+                }
+                let redo = mods.contains(.shift)
+                DispatchQueue.main.async { self.state.undo(redo: redo) }
                 return nil
             case 12 where mods == .command: // ⌘Q
                 NSApp.terminate(nil)

@@ -4,14 +4,20 @@ A minimalist macOS menu bar to-do list with tabs (**Work**, **Life** and **Threa
 
 - Click the circle to complete a todo; it disappears and isn't stored.
 - Type in the last row and press Return to add a todo.
-- Enter `---` to add a divider line. Select it by clicking it or with the arrow keys, then press Delete to remove it.
-- Drag rows (todos or dividers) to reorder them.
+- Enter `---` or press ⌘⇧D to add a divider line (⌘⇧D puts it below the selected row, or at the end). Select it by clicking it or with the arrow keys, then press Delete to remove it.
+- Select a todo and press Delete / Backspace to delete it from the list.
+- Drag rows (todos or dividers) to reorder them, or select one and press Shift-↑ / Shift-↓.
 - Todos persist in `~/Library/Application Support/MenuBarTodo/todos.json`.
 - Press Tab / Shift-Tab to cycle between tabs.
 - Click a todo or press ↑ / ↓ to select it, then press Return to complete it.
 - Press ⌘, to open Preferences, where you can rename, add, remove and reorder tabs.
+- Optional (in Preferences, all off by default):
+  - **Keep done and struck-through todos**: a completed todo stays (greyed out with a filled circle) for a set number of hours (24 by default), then disappears. Click the circle or press Return again to reopen it.
+  - **Strike through** a todo that fell off the plate: select it and press ⌘⇧X. It's shown with a filled circle and crossed out, and expires like a done todo. Press again to reopen it. Requires the option above.
+  - **Sort sections: open, done, struck through**: within each section (sections are split by dividers), open todos come first, then done, then struck through.
+- Press ⌘Z / ⌘⇧Z to undo / redo changes to the list (adding, completing, striking through, deleting, reordering). While you're typing a new todo, they undo your typing instead. History is kept until you quit.
 - Press Esc to close the popup.
-- Press ⌘Q while the popup is open to quit.
+- Press ⌘Q while the popup is open, or click **Quit Menu Bar To-Do** in Preferences, to quit.
 
 ## Open from Raycast (or anything that opens links)
 
